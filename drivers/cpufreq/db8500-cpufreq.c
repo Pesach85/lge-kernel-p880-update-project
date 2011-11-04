@@ -103,8 +103,7 @@ static unsigned int db8500_cpufreq_getspeed(unsigned int cpu)
 
 static int __cpuinit db8500_cpufreq_init(struct cpufreq_policy *policy)
 {
-	int res;
-	int i;
+	int i, res;
 
 	BUILD_BUG_ON(ARRAY_SIZE(idx2opp) + 1 != ARRAY_SIZE(freq_table));
 
@@ -114,6 +113,9 @@ static int __cpuinit db8500_cpufreq_init(struct cpufreq_policy *policy)
 		if (prcmu_has_arm_maxopp())
 			freq_table[2].frequency = 1000000;
 	}
+	pr_info("db8500-cpufreq : Available frequencies:\n");
+	for (i = 0; freq_table[i].frequency != CPUFREQ_TABLE_END; i++)
+		pr_info("  %d Mhz\n", freq_table[i].frequency/1000);
 
 	/* get policy fields based on the table */
 	res = cpufreq_frequency_table_cpuinfo(policy, freq_table);
