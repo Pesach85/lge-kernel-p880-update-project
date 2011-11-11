@@ -6211,6 +6211,21 @@ static int drxk_set_parameters(struct dvb_frontend *fe,
 	u32 IF;
 
 	dprintk(1, "\n");
+
+	if (!fe->ops.tuner_ops.get_if_frequency) {
+		printk(KERN_ERR
+		       "drxk: Error: get_if_frequency() not defined at tuner. Can't work without it!\n");
+		return -EINVAL;
+	}
+
+	if (state->m_OperationMode == OM_QAM_ITU_A ||
+	    state->m_OperationMode == OM_QAM_ITU_C) {
+		if (fe->dtv_property_cache.rolloff == ROLLOFF_13)
+			state->m_OperationMode = OM_QAM_ITU_C;
+		else
+			state->m_OperationMode = OM_QAM_ITU_A;
+	}
+
 	if (fe->ops.i2c_gate_ctrl)
 		fe->ops.i2c_gate_ctrl(fe, 1);
 	if (fe->ops.tuner_ops.set_params)
