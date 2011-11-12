@@ -1177,6 +1177,178 @@ _GLOBAL(kvmppc_h_set_dabr)
 	li	r3,0
 	blr
 
+_GLOBAL(kvmppc_h_cede)
+	ori	r11,r11,MSR_EE
+	std	r11,VCPU_MSR(r3)
+	li	r0,1
+	stb	r0,VCPU_CEDED(r3)
+	sync			/* order setting ceded vs. testing prodded */
+	lbz	r5,VCPU_PRODDED(r3)
+	cmpwi	r5,0
+	bne	1f
+	li	r0,0		/* set trap to 0 to say hcall is handled */
+	stw	r0,VCPU_TRAP(r3)
+	li	r0,H_SUCCESS
+	std	r0,VCPU_GPR(r3)(r3)
+BEGIN_FTR_SECTION
+	b	2f		/* just send it up to host on 970 */
+END_FTR_SECTION_IFCLR(CPU_FTR_ARCH_206)
+
+	/*
+	 * Set our bit in the bitmask of napping threads unless all the
+	 * other threads are already napping, in which case we send this
+	 * up to the host.
+	 */
+	ld	r5,HSTATE_KVM_VCORE(r13)
+	lwz	r6,VCPU_PTID(r3)
+	lwz	r8,VCORE_ENTRY_EXIT(r5)
+	clrldi	r8,r8,56
+	li	r0,1
+	sld	r0,r0,r6
+	addi	r6,r5,VCORE_NAPPING_THREADS
+31:	lwarx	r4,0,r6
+	or	r4,r4,r0
+	PPC_POPCNTW(r7,r4)
+	cmpw	r7,r8
+	bge	2f
+	stwcx.	r4,0,r6
+	bne	31b
+	li	r0,1
+	stb	r0,HSTATE_NAPPING(r13)
+	/* order napping_threads update vs testing entry_exit_count */
+	lwsync
+	mr	r4,r3
+	lwz	r7,VCORE_ENTRY_EXIT(r5)
+	cmpwi	r7,0x100
+	bge	33f		/* another thread already exiting */
+
+/*
+ * Although not specifically required by the architecture, POWER7
+ * preserves the following registers in nap mode, even if an SMT mode
+ * switch occurs: SLB entries, PURR, SPURR, AMOR, UAMOR, AMR, SPRG0-3,
+ * DAR, DSISR, DABR, DABRX, DSCR, PMCx, MMCRx, SIAR, SDAR.
+ */
+	/* Save non-volatile GPRs */
+	std	r14, VCPU_GPR(r14)(r3)
+	std	r15, VCPU_GPR(r15)(r3)
+	std	r16, VCPU_GPR(r16)(r3)
+	std	r17, VCPU_GPR(r17)(r3)
+	std	r18, VCPU_GPR(r18)(r3)
+	std	r19, VCPU_GPR(r19)(r3)
+	std	r20, VCPU_GPR(r20)(r3)
+	std	r21, VCPU_GPR(r21)(r3)
+	std	r22, VCPU_GPR(r22)(r3)
+	std	r23, VCPU_GPR(r23)(r3)
+	std	r24, VCPU_GPR(r24)(r3)
+	std	r25, VCPU_GPR(r25)(r3)
+	std	r26, VCPU_GPR(r26)(r3)
+	std	r27, VCPU_GPR(r27)(r3)
+	std	r28, VCPU_GPR(r28)(r3)
+	std	r29, VCPU_GPR(r29)(r3)
+	std	r30, VCPU_GPR(r30)(r3)
+	std	r31, VCPU_GPR(r31)(r3)
+
+	/* save FP state */
+	bl	.kvmppc_save_fp
+
+	/*
+	 * Take a nap until a decrementer or external interrupt occurs,
+	 * with PECE1 (wake on decr) and PECE0 (wake on external) set in LPCR
+	 */
+	li	r0,0x80
+	stb	r0,PACAPROCSTART(r13)
+	mfspr	r5,SPRN_LPCR
+	ori	r5,r5,LPCR_PECE0 | LPCR_PECE1
+	mtspr	SPRN_LPCR,r5
+	isync
+	li	r0, 0
+	std	r0, HSTATE_SCRATCH0(r13)
+	ptesync
+	ld	r0, HSTATE_SCRATCH0(r13)
+1:	cmpd	r0, r0
+	bne	1b
+	nap
+	b	.
+
+kvm_end_cede:
+	/* Woken by external or decrementer interrupt */
+	ld	r1, HSTATE_HOST_R1(r13)
+	ld	r2, PACATOC(r13)
+
+	/* If we're a secondary thread and we got here by an IPI, ack it */
+	ld	r4,HSTATE_KVM_VCPU(r13)
+	lwz	r3,VCPU_PTID(r4)
+	cmpwi	r3,0
+	beq	27f
+	mfspr	r3,SPRN_SRR1
+	rlwinm	r3,r3,44-31,0x7		/* extract wake reason field */
+	cmpwi	r3,4			/* was it an external interrupt? */
+	bne	27f
+	ld	r5, HSTATE_XICS_PHYS(r13)
+	li	r0,0xff
+	li	r6,XICS_QIRR
+	li	r7,XICS_XIRR
+	lwzcix	r8,r5,r7		/* ack the interrupt */
+	sync
+	stbcix	r0,r5,r6		/* clear it */
+	stwcix	r8,r5,r7		/* EOI it */
+27:
+	/* load up FP state */
+	bl	kvmppc_load_fp
+
+	/* Load NV GPRS */
+	ld	r14, VCPU_GPR(r14)(r4)
+	ld	r15, VCPU_GPR(r15)(r4)
+	ld	r16, VCPU_GPR(r16)(r4)
+	ld	r17, VCPU_GPR(r17)(r4)
+	ld	r18, VCPU_GPR(r18)(r4)
+	ld	r19, VCPU_GPR(r19)(r4)
+	ld	r20, VCPU_GPR(r20)(r4)
+	ld	r21, VCPU_GPR(r21)(r4)
+	ld	r22, VCPU_GPR(r22)(r4)
+	ld	r23, VCPU_GPR(r23)(r4)
+	ld	r24, VCPU_GPR(r24)(r4)
+	ld	r25, VCPU_GPR(r25)(r4)
+	ld	r26, VCPU_GPR(r26)(r4)
+	ld	r27, VCPU_GPR(r27)(r4)
+	ld	r28, VCPU_GPR(r28)(r4)
+	ld	r29, VCPU_GPR(r29)(r4)
+	ld	r30, VCPU_GPR(r30)(r4)
+	ld	r31, VCPU_GPR(r31)(r4)
+
+	/* clear our bit in vcore->napping_threads */
+33:	ld	r5,HSTATE_KVM_VCORE(r13)
+	lwz	r3,VCPU_PTID(r4)
+	li	r0,1
+	sld	r0,r0,r3
+	addi	r6,r5,VCORE_NAPPING_THREADS
+32:	lwarx	r7,0,r6
+	andc	r7,r7,r0
+	stwcx.	r7,0,r6
+	bne	32b
+	li	r0,0
+	stb	r0,HSTATE_NAPPING(r13)
+
+	/* see if any other thread is already exiting */
+	lwz	r0,VCORE_ENTRY_EXIT(r5)
+	cmpwi	r0,0x100
+	blt	kvmppc_cede_reentry	/* if not go back to guest */
+
+	/* some threads are exiting, so go to the guest exit path */
+	b	hcall_real_fallback
+
+	/* cede when already previously prodded case */
+1:	li	r0,0
+	stb	r0,VCPU_PRODDED(r3)
+	sync			/* order testing prodded vs. clearing ceded */
+	stb	r0,VCPU_CEDED(r3)
+	li	r3,H_SUCCESS
+	blr
+
+	/* we've ceded but we want to give control to the host */
+2:	li	r3,H_TOO_HARD
+	blr
+
 secondary_too_late:
 	ld	r5,HSTATE_KVM_VCORE(r13)
 	HMT_LOW
