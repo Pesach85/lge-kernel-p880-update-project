@@ -216,6 +216,13 @@ xfs_end_io(
 	struct xfs_inode *ip = XFS_I(ioend->io_inode);
 	int		error = 0;
 
+	if (XFS_FORCED_SHUTDOWN(ip->i_mount)) {
+		ioend->io_error = -EIO;
+		goto done;
+	}
+	if (ioend->io_error)
+		goto done;
+
 	/*
 	 * For unwritten extents we need to issue transactions to convert a
 	 * range to normal written extens after the data I/O has finished.
