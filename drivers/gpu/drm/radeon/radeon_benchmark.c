@@ -36,8 +36,8 @@ void radeon_benchmark_move(struct radeon_device *rdev, unsigned bsize,
 	unsigned long start_jiffies;
 	unsigned long end_jiffies;
 	unsigned long time;
-	unsigned i, n, size;
-	int r;
+	int r, n;
+	int time;
 
 	size = bsize;
 	n = 1024;

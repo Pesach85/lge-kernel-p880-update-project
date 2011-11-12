@@ -188,6 +188,22 @@ nouveau_perf_init(struct drm_device *dev)
 	}
 
 	entry = perf + headerlen;
+
+	/* For version 0x15, initialize memtiming table */
+	if(version == 0x15) {
+		memtimings->timing =
+				kcalloc(entries, sizeof(*memtimings->timing), GFP_KERNEL);
+		if (!memtimings->timing) {
+			NV_WARN(dev,"Could not allocate memtiming table\n");
+			return;
+		}
+
+		mt_hdr.entry_cnt = entries;
+		mt_hdr.entry_len = 14;
+		mt_hdr.version = version;
+		mt_hdr.header_len = 4;
+	}
+
 	for (i = 0; i < entries; i++) {
 		struct nouveau_pm_level *perflvl = &pm->perflvl[pm->nr_perflvl];
 

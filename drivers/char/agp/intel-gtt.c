@@ -1177,6 +1177,26 @@ static void gen6_cleanup(void)
 {
 }
 
+/* Certain Gen5 chipsets require require idling the GPU before
+ * unmapping anything from the GTT when VT-d is enabled.
+ */
+static inline int needs_idle_maps(void)
+{
+#ifdef CONFIG_INTEL_IOMMU
+	const unsigned short gpu_devid = intel_private.pcidev->device;
+	extern int intel_iommu_gfx_mapped;
+
+	/* Query intel_iommu to see if we need the workaround. Presumably that
+	 * was loaded first.
+	 */
+	if ((gpu_devid == PCI_DEVICE_ID_INTEL_IRONLAKE_M_HB ||
+	     gpu_devid == PCI_DEVICE_ID_INTEL_IRONLAKE_M_IG) &&
+	     intel_iommu_gfx_mapped)
+		return 1;
+#endif
+	return 0;
+}
+
 static int i9xx_setup(void)
 {
 	u32 reg_addr;
@@ -1210,6 +1230,9 @@ static int i9xx_setup(void)
 		}
 		intel_private.gtt_bus_addr = reg_addr + gtt_offset;
 	}
+
+	if (needs_idle_maps())
+		intel_private.base.do_idle_maps = 1;
 
 	intel_i9xx_setup_flush();
 

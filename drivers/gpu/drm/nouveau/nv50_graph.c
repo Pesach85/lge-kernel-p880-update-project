@@ -149,6 +149,12 @@ nv50_graph_init_regs__nv(struct drm_device *dev)
 
 	NV_DEBUG(dev, "\n");
 
+	/* master reset */
+	nv_mask(dev, 0x000200, 0x00201000, 0x00000000);
+	nv_mask(dev, 0x000200, 0x00201000, 0x00201000);
+	nv_wr32(dev, 0x40008c, 0x00000004); /* HW_CTX_SWITCH_ENABLED */
+
+	/* reset/enable traps and interrupts */
 	nv_wr32(dev, 0x400804, 0xc0000000);
 	nv_wr32(dev, 0x406800, 0xc0000000);
 	nv_wr32(dev, 0x400c04, 0xc0000000);

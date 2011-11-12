@@ -107,6 +107,10 @@ int vmw_du_crtc_cursor_set(struct drm_crtc *crtc, struct drm_file *file_priv,
 	struct vmw_dma_buffer *dmabuf = NULL;
 	int ret;
 
+	/* A lot of the code assumes this */
+	if (handle && (width != 64 || height != 64))
+		return -EINVAL;
+
 	if (handle) {
 		ret = vmw_user_surface_lookup_handle(dev_priv, tfile,
 						     handle, &surface);
@@ -408,6 +412,96 @@ static void vmw_framebuffer_present_fs_callback(struct work_struct *work)
 	mutex_lock(&vfbs->work_lock);
 	if (!vfbs->present_fs)
 		goto out_unlock;
+
+	num_units = 0;
+	list_for_each_entry(crtc, &dev_priv->dev->mode_config.crtc_list,
+			    head) {
+		if (crtc->fb != &framebuffer->base)
+			continue;
+		units[num_units++] = vmw_crtc_to_du(crtc);
+	}
+
+	BUG_ON(!clips || !num_clips);
+
+	fifo_size = sizeof(*cmd) + sizeof(SVGASignedRect) * num_clips;
+	cmd = kzalloc(fifo_size, GFP_KERNEL);
+	if (unlikely(cmd == NULL)) {
+		DRM_ERROR("Temporary fifo memory alloc failed.\n");
+		return -ENOMEM;
+	}
+
+	left = clips->x1;
+	right = clips->x2;
+	top = clips->y1;
+	bottom = clips->y2;
+
+	/* skip the first clip rect */
+	for (i = 1, clips_ptr = clips + inc;
+	     i < num_clips; i++, clips_ptr += inc) {
+		left = min_t(int, left, (int)clips_ptr->x1);
+		right = max_t(int, right, (int)clips_ptr->x2);
+		top = min_t(int, top, (int)clips_ptr->y1);
+		bottom = max_t(int, bottom, (int)clips_ptr->y2);
+	}
+
+	/* only need to do this once */
+	memset(cmd, 0, fifo_size);
+	cmd->header.id = cpu_to_le32(SVGA_3D_CMD_BLIT_SURFACE_TO_SCREEN);
+	cmd->header.size = cpu_to_le32(fifo_size - sizeof(cmd->header));
+
+	cmd->body.srcRect.left = left;
+	cmd->body.srcRect.right = right;
+	cmd->body.srcRect.top = top;
+	cmd->body.srcRect.bottom = bottom;
+
+	clips_ptr = clips;
+	blits = (SVGASignedRect *)&cmd[1];
+	for (i = 0; i < num_clips; i++, clips_ptr += inc) {
+		blits[i].left   = clips_ptr->x1 - left;
+		blits[i].right  = clips_ptr->x2 - left;
+		blits[i].top    = clips_ptr->y1 - top;
+		blits[i].bottom = clips_ptr->y2 - top;
+	}
+
+	/* do per unit writing, reuse fifo for each */
+	for (i = 0; i < num_units; i++) {
+		struct vmw_display_unit *unit = units[i];
+		int clip_x1 = left - unit->crtc.x;
+		int clip_y1 = top - unit->crtc.y;
+		int clip_x2 = right - unit->crtc.x;
+		int clip_y2 = bottom - unit->crtc.y;
+
+		/* skip any crtcs that misses the clip region */
+		if (clip_x1 >= unit->crtc.mode.hdisplay ||
+		    clip_y1 >= unit->crtc.mode.vdisplay ||
+		    clip_x2 <= 0 || clip_y2 <= 0)
+			continue;
+
+		/* need to reset sid as it is changed by execbuf */
+		cmd->body.srcImage.sid = cpu_to_le32(framebuffer->user_handle);
+
+		cmd->body.destScreenId = unit->unit;
+
+		/*
+		 * The blit command is a lot more resilient then the
+		 * readback command when it comes to clip rects. So its
+		 * okay to go out of bounds.
+		 */
+
+		cmd->body.destRect.left = clip_x1;
+		cmd->body.destRect.right = clip_x2;
+		cmd->body.destRect.top = clip_y1;
+		cmd->body.destRect.bottom = clip_y2;
+
+
+		ret = vmw_execbuf_process(file_priv, dev_priv, NULL, cmd,
+					  fifo_size, 0, NULL);
+
+		if (unlikely(ret != 0))
+			break;
+	}
+
+	kfree(cmd);
 
 	cmd = vmw_fifo_reserve(dev_priv, sizeof(*cmd));
 	if (unlikely(cmd == NULL))
@@ -942,7 +1036,10 @@ int vmw_kms_close(struct vmw_private *dev_priv)
 	 * drm_encoder_cleanup which takes the lock we deadlock.
 	 */
 	drm_mode_config_cleanup(dev_priv->dev);
-	vmw_kms_close_legacy_display_system(dev_priv);
+	if (dev_priv->sou_priv)
+		vmw_kms_close_screen_object_display(dev_priv);
+	else
+		vmw_kms_close_legacy_display_system(dev_priv);
 	return 0;
 }
 
