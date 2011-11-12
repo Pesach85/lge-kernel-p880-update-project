@@ -242,6 +242,322 @@ static int readahead_cache(struct inode *inode)
 	return 0;
 }
 
+struct io_ctl {
+	void *cur, *orig;
+	struct page *page;
+	struct page **pages;
+	struct btrfs_root *root;
+	unsigned long size;
+	int index;
+	int num_pages;
+	unsigned check_crcs:1;
+};
+
+static int io_ctl_init(struct io_ctl *io_ctl, struct inode *inode,
+		       struct btrfs_root *root)
+{
+	memset(io_ctl, 0, sizeof(struct io_ctl));
+	io_ctl->num_pages = (i_size_read(inode) + PAGE_CACHE_SIZE - 1) >>
+		PAGE_CACHE_SHIFT;
+	io_ctl->pages = kzalloc(sizeof(struct page *) * io_ctl->num_pages,
+				GFP_NOFS);
+	if (!io_ctl->pages)
+		return -ENOMEM;
+	io_ctl->root = root;
+	if (btrfs_ino(inode) != BTRFS_FREE_INO_OBJECTID)
+		io_ctl->check_crcs = 1;
+	return 0;
+}
+
+static void io_ctl_free(struct io_ctl *io_ctl)
+{
+	kfree(io_ctl->pages);
+}
+
+static void io_ctl_unmap_page(struct io_ctl *io_ctl)
+{
+	if (io_ctl->cur) {
+		kunmap(io_ctl->page);
+		io_ctl->cur = NULL;
+		io_ctl->orig = NULL;
+	}
+}
+
+static void io_ctl_map_page(struct io_ctl *io_ctl, int clear)
+{
+	WARN_ON(io_ctl->cur);
+	BUG_ON(io_ctl->index >= io_ctl->num_pages);
+	io_ctl->page = io_ctl->pages[io_ctl->index++];
+	io_ctl->cur = kmap(io_ctl->page);
+	io_ctl->orig = io_ctl->cur;
+	io_ctl->size = PAGE_CACHE_SIZE;
+	if (clear)
+		memset(io_ctl->cur, 0, PAGE_CACHE_SIZE);
+}
+
+static void io_ctl_drop_pages(struct io_ctl *io_ctl)
+{
+	int i;
+
+	io_ctl_unmap_page(io_ctl);
+
+	for (i = 0; i < io_ctl->num_pages; i++) {
+		ClearPageChecked(io_ctl->pages[i]);
+		unlock_page(io_ctl->pages[i]);
+		page_cache_release(io_ctl->pages[i]);
+	}
+}
+
+static int io_ctl_prepare_pages(struct io_ctl *io_ctl, struct inode *inode,
+				int uptodate)
+{
+	struct page *page;
+	gfp_t mask = btrfs_alloc_write_mask(inode->i_mapping);
+	int i;
+
+	for (i = 0; i < io_ctl->num_pages; i++) {
+		page = find_or_create_page(inode->i_mapping, i, mask);
+		if (!page) {
+			io_ctl_drop_pages(io_ctl);
+			return -ENOMEM;
+		}
+		io_ctl->pages[i] = page;
+		if (uptodate && !PageUptodate(page)) {
+			btrfs_readpage(NULL, page);
+			lock_page(page);
+			if (!PageUptodate(page)) {
+				printk(KERN_ERR "btrfs: error reading free "
+				       "space cache\n");
+				io_ctl_drop_pages(io_ctl);
+				return -EIO;
+			}
+		}
+	}
+
+	return 0;
+}
+
+static void io_ctl_set_generation(struct io_ctl *io_ctl, u64 generation)
+{
+	u64 *val;
+
+	io_ctl_map_page(io_ctl, 1);
+
+	/*
+	 * Skip the csum areas.  If we don't check crcs then we just have a
+	 * 64bit chunk at the front of the first page.
+	 */
+	if (io_ctl->check_crcs) {
+		io_ctl->cur += (sizeof(u32) * io_ctl->num_pages);
+		io_ctl->size -= sizeof(u64) + (sizeof(u32) * io_ctl->num_pages);
+	} else {
+		io_ctl->cur += sizeof(u64);
+		io_ctl->size -= sizeof(u64) * 2;
+	}
+
+	val = io_ctl->cur;
+	*val = cpu_to_le64(generation);
+	io_ctl->cur += sizeof(u64);
+}
+
+static int io_ctl_check_generation(struct io_ctl *io_ctl, u64 generation)
+{
+	u64 *gen;
+
+	/*
+	 * Skip the crc area.  If we don't check crcs then we just have a 64bit
+	 * chunk at the front of the first page.
+	 */
+	if (io_ctl->check_crcs) {
+		io_ctl->cur += sizeof(u32) * io_ctl->num_pages;
+		io_ctl->size -= sizeof(u64) +
+			(sizeof(u32) * io_ctl->num_pages);
+	} else {
+		io_ctl->cur += sizeof(u64);
+		io_ctl->size -= sizeof(u64) * 2;
+	}
+
+	gen = io_ctl->cur;
+	if (le64_to_cpu(*gen) != generation) {
+		printk_ratelimited(KERN_ERR "btrfs: space cache generation "
+				   "(%Lu) does not match inode (%Lu)\n", *gen,
+				   generation);
+		io_ctl_unmap_page(io_ctl);
+		return -EIO;
+	}
+	io_ctl->cur += sizeof(u64);
+	return 0;
+}
+
+static void io_ctl_set_crc(struct io_ctl *io_ctl, int index)
+{
+	u32 *tmp;
+	u32 crc = ~(u32)0;
+	unsigned offset = 0;
+
+	if (!io_ctl->check_crcs) {
+		io_ctl_unmap_page(io_ctl);
+		return;
+	}
+
+	if (index == 0)
+		offset = sizeof(u32) * io_ctl->num_pages;;
+
+	crc = btrfs_csum_data(io_ctl->root, io_ctl->orig + offset, crc,
+			      PAGE_CACHE_SIZE - offset);
+	btrfs_csum_final(crc, (char *)&crc);
+	io_ctl_unmap_page(io_ctl);
+	tmp = kmap(io_ctl->pages[0]);
+	tmp += index;
+	*tmp = crc;
+	kunmap(io_ctl->pages[0]);
+}
+
+static int io_ctl_check_crc(struct io_ctl *io_ctl, int index)
+{
+	u32 *tmp, val;
+	u32 crc = ~(u32)0;
+	unsigned offset = 0;
+
+	if (!io_ctl->check_crcs) {
+		io_ctl_map_page(io_ctl, 0);
+		return 0;
+	}
+
+	if (index == 0)
+		offset = sizeof(u32) * io_ctl->num_pages;
+
+	tmp = kmap(io_ctl->pages[0]);
+	tmp += index;
+	val = *tmp;
+	kunmap(io_ctl->pages[0]);
+
+	io_ctl_map_page(io_ctl, 0);
+	crc = btrfs_csum_data(io_ctl->root, io_ctl->orig + offset, crc,
+			      PAGE_CACHE_SIZE - offset);
+	btrfs_csum_final(crc, (char *)&crc);
+	if (val != crc) {
+		printk_ratelimited(KERN_ERR "btrfs: csum mismatch on free "
+				   "space cache\n");
+		io_ctl_unmap_page(io_ctl);
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static int io_ctl_add_entry(struct io_ctl *io_ctl, u64 offset, u64 bytes,
+			    void *bitmap)
+{
+	struct btrfs_free_space_entry *entry;
+
+	if (!io_ctl->cur)
+		return -ENOSPC;
+
+	entry = io_ctl->cur;
+	entry->offset = cpu_to_le64(offset);
+	entry->bytes = cpu_to_le64(bytes);
+	entry->type = (bitmap) ? BTRFS_FREE_SPACE_BITMAP :
+		BTRFS_FREE_SPACE_EXTENT;
+	io_ctl->cur += sizeof(struct btrfs_free_space_entry);
+	io_ctl->size -= sizeof(struct btrfs_free_space_entry);
+
+	if (io_ctl->size >= sizeof(struct btrfs_free_space_entry))
+		return 0;
+
+	io_ctl_set_crc(io_ctl, io_ctl->index - 1);
+
+	/* No more pages to map */
+	if (io_ctl->index >= io_ctl->num_pages)
+		return 0;
+
+	/* map the next page */
+	io_ctl_map_page(io_ctl, 1);
+	return 0;
+}
+
+static int io_ctl_add_bitmap(struct io_ctl *io_ctl, void *bitmap)
+{
+	if (!io_ctl->cur)
+		return -ENOSPC;
+
+	/*
+	 * If we aren't at the start of the current page, unmap this one and
+	 * map the next one if there is any left.
+	 */
+	if (io_ctl->cur != io_ctl->orig) {
+		io_ctl_set_crc(io_ctl, io_ctl->index - 1);
+		if (io_ctl->index >= io_ctl->num_pages)
+			return -ENOSPC;
+		io_ctl_map_page(io_ctl, 0);
+	}
+
+	memcpy(io_ctl->cur, bitmap, PAGE_CACHE_SIZE);
+	io_ctl_set_crc(io_ctl, io_ctl->index - 1);
+	if (io_ctl->index < io_ctl->num_pages)
+		io_ctl_map_page(io_ctl, 0);
+	return 0;
+}
+
+static void io_ctl_zero_remaining_pages(struct io_ctl *io_ctl)
+{
+	/*
+	 * If we're not on the boundary we know we've modified the page and we
+	 * need to crc the page.
+	 */
+	if (io_ctl->cur != io_ctl->orig)
+		io_ctl_set_crc(io_ctl, io_ctl->index - 1);
+	else
+		io_ctl_unmap_page(io_ctl);
+
+	while (io_ctl->index < io_ctl->num_pages) {
+		io_ctl_map_page(io_ctl, 1);
+		io_ctl_set_crc(io_ctl, io_ctl->index - 1);
+	}
+}
+
+static int io_ctl_read_entry(struct io_ctl *io_ctl,
+			    struct btrfs_free_space *entry, u8 *type)
+{
+	struct btrfs_free_space_entry *e;
+	int ret;
+
+	if (!io_ctl->cur) {
+		ret = io_ctl_check_crc(io_ctl, io_ctl->index);
+		if (ret)
+			return ret;
+	}
+
+	e = io_ctl->cur;
+	entry->offset = le64_to_cpu(e->offset);
+	entry->bytes = le64_to_cpu(e->bytes);
+	*type = e->type;
+	io_ctl->cur += sizeof(struct btrfs_free_space_entry);
+	io_ctl->size -= sizeof(struct btrfs_free_space_entry);
+
+	if (io_ctl->size >= sizeof(struct btrfs_free_space_entry))
+		return 0;
+
+	io_ctl_unmap_page(io_ctl);
+
+	return 0;
+}
+
+static int io_ctl_read_bitmap(struct io_ctl *io_ctl,
+			      struct btrfs_free_space *entry)
+{
+	int ret;
+
+	ret = io_ctl_check_crc(io_ctl, io_ctl->index);
+	if (ret)
+		return ret;
+
+	memcpy(entry->bitmap, io_ctl->cur, PAGE_CACHE_SIZE);
+	io_ctl_unmap_page(io_ctl);
+
+	return 0;
+}
+
 int __load_free_space_cache(struct btrfs_root *root, struct inode *inode,
 			    struct btrfs_free_space_ctl *ctl,
 			    struct btrfs_path *path, u64 offset)
@@ -435,11 +751,13 @@ int __load_free_space_cache(struct btrfs_root *root, struct inode *inode,
 			goto next;
 		}
 
-		/*
-		 * We add the bitmaps at the end of the entries in order that
-		 * the bitmap entries are added to the cache.
-		 */
-		e = list_entry(bitmaps.next, struct btrfs_free_space, list);
+	io_ctl_unmap_page(&io_ctl);
+
+	/*
+	 * We add the bitmaps at the end of the entries in order that
+	 * the bitmap entries are added to the cache.
+	 */
+	list_for_each_entry_safe(e, n, &bitmaps, list) {
 		list_del_init(&e->list);
 		memcpy(e->bitmap, addr, PAGE_CACHE_SIZE);
 		kunmap(page);

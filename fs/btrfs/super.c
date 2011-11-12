@@ -195,6 +195,8 @@ static match_table_t tokens = {
 	{Opt_subvolrootid, "subvolrootid=%d"},
 	{Opt_defrag, "autodefrag"},
 	{Opt_inode_cache, "inode_cache"},
+	{Opt_no_space_cache, "nospace_cache"},
+	{Opt_recovery, "recovery"},
 	{Opt_err, NULL},
 };
 
@@ -430,6 +432,7 @@ static int btrfs_parse_early_options(const char *options, fmode_t flags,
 		token = match_token(p, tokens, args);
 		switch (token) {
 		case Opt_subvol:
+			kfree(*subvol_name);
 			*subvol_name = match_strdup(&args[0]);
 			break;
 		case Opt_subvolid:
@@ -719,6 +722,8 @@ static int btrfs_show_options(struct seq_file *seq, struct vfsmount *vfs)
 		seq_puts(seq, ",noacl");
 	if (btrfs_test_opt(root, SPACE_CACHE))
 		seq_puts(seq, ",space_cache");
+	else
+		seq_puts(seq, ",nospace_cache");
 	if (btrfs_test_opt(root, CLEAR_CACHE))
 		seq_puts(seq, ",clear_cache");
 	if (btrfs_test_opt(root, USER_SUBVOL_RM_ALLOWED))
@@ -767,7 +772,6 @@ static struct dentry *btrfs_mount(struct file_system_type *fs_type, int flags,
 	struct super_block *s;
 	struct dentry *root;
 	struct btrfs_fs_devices *fs_devices = NULL;
-	struct btrfs_root *tree_root = NULL;
 	struct btrfs_fs_info *fs_info = NULL;
 	fmode_t mode = FMODE_READ;
 	char *subvol_name = NULL;
@@ -781,8 +785,10 @@ static struct dentry *btrfs_mount(struct file_system_type *fs_type, int flags,
 	error = btrfs_parse_early_options(data, mode, fs_type,
 					  &subvol_name, &subvol_objectid,
 					  &subvol_rootid, &fs_devices);
-	if (error)
+	if (error) {
+		kfree(subvol_name);
 		return ERR_PTR(error);
+	}
 
 	error = btrfs_scan_one_device(device_name, mode, fs_type, &fs_devices);
 	if (error)
@@ -804,19 +810,44 @@ static struct dentry *btrfs_mount(struct file_system_type *fs_type, int flags,
 	 * then open_ctree will properly initialize everything later.
 	 */
 	fs_info = kzalloc(sizeof(struct btrfs_fs_info), GFP_NOFS);
-	tree_root = kzalloc(sizeof(struct btrfs_root), GFP_NOFS);
-	if (!fs_info || !tree_root) {
+	if (!fs_info)
+		return ERR_PTR(-ENOMEM);
+
+	fs_info->tree_root = kzalloc(sizeof(struct btrfs_root), GFP_NOFS);
+	if (!fs_info->tree_root) {
 		error = -ENOMEM;
-		goto error_close_devices;
+		goto error_fs_info;
 	}
-	fs_info->tree_root = tree_root;
+	fs_info->tree_root->fs_info = fs_info;
 	fs_info->fs_devices = fs_devices;
-	tree_root->fs_info = fs_info;
 
 	bdev = fs_devices->latest_bdev;
 	s = sget(fs_type, btrfs_test_super, btrfs_set_super, tree_root);
 	if (IS_ERR(s))
 		goto error_s;
+	fs_info->super_copy = kzalloc(BTRFS_SUPER_INFO_SIZE, GFP_NOFS);
+	fs_info->super_for_commit = kzalloc(BTRFS_SUPER_INFO_SIZE, GFP_NOFS);
+	if (!fs_info->super_copy || !fs_info->super_for_commit) {
+		error = -ENOMEM;
+		goto error_fs_info;
+	}
+
+	error = btrfs_open_devices(fs_devices, mode, fs_type);
+	if (error)
+		goto error_fs_info;
+
+	if (!(flags & MS_RDONLY) && fs_devices->rw_devices == 0) {
+		error = -EACCES;
+		goto error_close_devices;
+	}
+
+	bdev = fs_devices->latest_bdev;
+	s = sget(fs_type, btrfs_test_super, btrfs_set_super,
+		 fs_info->tree_root);
+	if (IS_ERR(s)) {
+		error = PTR_ERR(s);
+		goto error_close_devices;
+	}
 
 	if (s->s_root) {
 		if ((flags ^ s->s_flags) & MS_RDONLY) {
@@ -828,6 +859,7 @@ static struct dentry *btrfs_mount(struct file_system_type *fs_type, int flags,
 		btrfs_close_devices(fs_devices);
 		kfree(fs_info);
 		kfree(tree_root);
+		free_fs_info(fs_info);
 	} else {
 		char b[BDEVNAME_SIZE];
 
@@ -895,6 +927,8 @@ error_close_devices:
 	kfree(tree_root);
 error_free_subvol_name:
 	kfree(subvol_name);
+error_fs_info:
+	free_fs_info(fs_info);
 	return ERR_PTR(error);
 }
 
