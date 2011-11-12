@@ -522,6 +522,31 @@ static unsigned int crypto_shash_extsize(struct crypto_alg *alg)
 	return alg->cra_ctxsize;
 }
 
+#ifdef CONFIG_NET
+static int crypto_shash_report(struct sk_buff *skb, struct crypto_alg *alg)
+{
+	struct crypto_report_hash rhash;
+	struct shash_alg *salg = __crypto_shash_alg(alg);
+
+	snprintf(rhash.type, CRYPTO_MAX_ALG_NAME, "%s", "shash");
+	rhash.blocksize = alg->cra_blocksize;
+	rhash.digestsize = salg->digestsize;
+
+	NLA_PUT(skb, CRYPTOCFGA_REPORT_HASH,
+		sizeof(struct crypto_report_hash), &rhash);
+
+	return 0;
+
+nla_put_failure:
+	return -EMSGSIZE;
+}
+#else
+static int crypto_shash_report(struct sk_buff *skb, struct crypto_alg *alg)
+{
+	return -ENOSYS;
+}
+#endif
+
 static void crypto_shash_show(struct seq_file *m, struct crypto_alg *alg)
 	__attribute__ ((unused));
 static void crypto_shash_show(struct seq_file *m, struct crypto_alg *alg)
